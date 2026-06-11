@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 type Marker = { id: number; x: number; y: number };
 
@@ -12,6 +12,14 @@ type ImageState = {
   currentW: number;
   currentH: number;
 };
+
+const MIN_ZOOM = 0.1;
+const MAX_ZOOM = 8;
+const ZOOM_STEP = 1.25;
+
+function clamp(v: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, v));
+}
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -34,6 +42,15 @@ function readImage(file: File): Promise<{ dataUrl: string; w: number; h: number 
   });
 }
 
+async function copyText(text: string): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function PointPreviewer() {
   const [image, setImage] = useState<ImageState | null>(null);
   const [markers, setMarkers] = useState<Marker[]>([]);
@@ -44,8 +61,19 @@ export function PointPreviewer() {
   const [hover, setHover] = useState<{ x: number; y: number } | null>(null);
   const [dragOver, setDragOver] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [zoom, setZoom] = useState(1);
+  const [copied, setCopied] = useState<string | null>(null);
+
   const nextIdRef = useRef(1);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const canvasContainerRef = useRef<HTMLDivElement>(null);
+  const copyTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (copyTimerRef.current) window.clearTimeout(copyTimerRef.current);
+    };
+  }, []);
 
   async function loadFile(file: File | null | undefined) {
     setError(null);
@@ -60,6 +88,7 @@ export function PointPreviewer() {
       setResizeW(String(w));
       setResizeH(String(h));
       setMarkers([]);
+      setZoom(1);
       nextIdRef.current = 1;
     } catch {
       setError("Could not read image.");
@@ -132,6 +161,37 @@ export function PointPreviewer() {
     setMarkers([]);
     setHover(null);
     setError(null);
+    setZoom(1);
+  }
+
+  function zoomIn() {
+    setZoom((z) => clamp(z * ZOOM_STEP, MIN_ZOOM, MAX_ZOOM));
+  }
+  function zoomOut() {
+    setZoom((z) => clamp(z / ZOOM_STEP, MIN_ZOOM, MAX_ZOOM));
+  }
+  function zoomReset() {
+    setZoom(1);
+  }
+  function zoomFit() {
+    const c = canvasContainerRef.current;
+    if (!c || !image) return;
+    const PAD = 32;
+    const wScale = (c.clientWidth - PAD) / image.currentW;
+    const hScale = (c.clientHeight - PAD) / image.currentH;
+    const fit = clamp(Math.min(wScale, hScale), MIN_ZOOM, MAX_ZOOM);
+    setZoom(fit);
+  }
+
+  function flashCopied(key: string) {
+    setCopied(key);
+    if (copyTimerRef.current) window.clearTimeout(copyTimerRef.current);
+    copyTimerRef.current = window.setTimeout(() => setCopied(null), 1200);
+  }
+
+  async function copyCoord(x: number, y: number, key: string) {
+    const ok = await copyText(`${x}, ${y}`);
+    if (ok) flashCopied(key);
   }
 
   if (!image) {
@@ -189,20 +249,22 @@ export function PointPreviewer() {
     );
   }
 
-  const displayScale = image.currentW / image.originalW;
+  const renderedW = image.currentW * zoom;
+  const renderedH = image.currentH * zoom;
 
   return (
     <div className="grid w-full grid-cols-1 gap-4 lg:grid-cols-[1fr_280px]">
       <div className="flex min-w-0 flex-col gap-3">
         <div
+          ref={canvasContainerRef}
           className="overflow-auto rounded-2xl border border-zinc-200 bg-zinc-50 p-4 dark:border-zinc-800 dark:bg-zinc-950"
-          style={{ maxHeight: "70vh" }}
+          style={{ maxHeight: "70vh", minHeight: "320px" }}
         >
           <div
             className="relative inline-block select-none"
             style={{
-              width: image.currentW,
-              height: image.currentH,
+              width: renderedW,
+              height: renderedH,
               cursor: mode === "mark" ? "crosshair" : "default",
             }}
             onClick={handleCanvasClick}
@@ -221,8 +283,8 @@ export function PointPreviewer() {
                 key={m.id}
                 className="pointer-events-none absolute"
                 style={{
-                  left: m.x * displayScale,
-                  top: m.y * displayScale,
+                  left: (m.x / image.originalW) * renderedW,
+                  top: (m.y / image.originalH) * renderedH,
                   transform: "translate(-50%, -50%)",
                 }}
               >
@@ -244,10 +306,7 @@ export function PointPreviewer() {
                 : "text-zinc-700 hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-900"
             }`}
           >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <line x1="12" y1="5" x2="12" y2="19" />
-              <line x1="5" y1="12" x2="19" y2="12" />
-            </svg>
+            <PlusIcon />
             Mark
           </button>
           <button
@@ -258,10 +317,62 @@ export function PointPreviewer() {
           >
             Clear
           </button>
-          <div className="ml-auto flex items-center gap-3">
-            <span className="font-mono text-xs text-zinc-500">
-              {hover ? `${hover.x}, ${hover.y}` : "—"}
-            </span>
+
+          <Divider />
+
+          <div className="flex items-center gap-0.5">
+            <button
+              type="button"
+              onClick={zoomOut}
+              disabled={zoom <= MIN_ZOOM + 1e-9}
+              aria-label="Zoom out"
+              className="rounded-md p-1.5 text-zinc-700 transition-colors hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-40 dark:text-zinc-300 dark:hover:bg-zinc-900"
+            >
+              <MinusIcon />
+            </button>
+            <button
+              type="button"
+              onClick={zoomReset}
+              title="Reset to 100%"
+              className="min-w-[3.5rem] rounded-md px-2 py-1.5 text-center font-mono text-xs text-zinc-700 transition-colors hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-900"
+            >
+              {Math.round(zoom * 100)}%
+            </button>
+            <button
+              type="button"
+              onClick={zoomIn}
+              disabled={zoom >= MAX_ZOOM - 1e-9}
+              aria-label="Zoom in"
+              className="rounded-md p-1.5 text-zinc-700 transition-colors hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-40 dark:text-zinc-300 dark:hover:bg-zinc-900"
+            >
+              <PlusIcon />
+            </button>
+            <button
+              type="button"
+              onClick={zoomFit}
+              className="rounded-md px-2 py-1.5 text-xs font-medium text-zinc-700 transition-colors hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-900"
+            >
+              Fit
+            </button>
+          </div>
+
+          <div className="ml-auto flex items-center gap-1.5">
+            <div className="flex items-center gap-1 rounded-md border border-zinc-200 bg-zinc-50 px-2 py-1 font-mono text-xs text-zinc-700 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-300">
+              <span className="text-zinc-400 dark:text-zinc-500">X</span>
+              <span className="min-w-[2ch] text-right">{hover ? hover.x : "—"}</span>
+              <span className="ml-2 text-zinc-400 dark:text-zinc-500">Y</span>
+              <span className="min-w-[2ch] text-right">{hover ? hover.y : "—"}</span>
+            </div>
+            <button
+              type="button"
+              disabled={!hover}
+              onClick={() => hover && copyCoord(hover.x, hover.y, "cursor")}
+              aria-label="Copy cursor coordinates"
+              title="Copy cursor X, Y"
+              className="rounded-md p-1.5 text-zinc-500 transition-colors hover:bg-zinc-100 hover:text-zinc-900 disabled:cursor-not-allowed disabled:opacity-30 dark:text-zinc-400 dark:hover:bg-zinc-900 dark:hover:text-zinc-100"
+            >
+              {copied === "cursor" ? <CheckIcon /> : <CopyIcon />}
+            </button>
             <button
               type="button"
               onClick={clearImage}
@@ -282,8 +393,15 @@ export function PointPreviewer() {
             <InfoRow label="Name" value={image.file.name} />
             <InfoRow label="Type" value={image.file.type || "—"} />
             <InfoRow label="Size" value={formatBytes(image.file.size)} />
-            <InfoRow label="Original" value={`${image.originalW} × ${image.originalH}`} />
-            <InfoRow label="Current" value={`${image.currentW} × ${image.currentH}`} />
+            <InfoRow
+              label="Original"
+              value={`${image.originalW} W × ${image.originalH} H`}
+            />
+            <InfoRow
+              label="Current"
+              value={`${image.currentW} W × ${image.currentH} H`}
+            />
+            <InfoRow label="Zoom" value={`${Math.round(zoom * 100)}%`} />
           </dl>
         </section>
 
@@ -294,7 +412,7 @@ export function PointPreviewer() {
           <div className="mt-3 space-y-3">
             <div className="grid grid-cols-2 gap-2">
               <label className="block">
-                <span className="text-xs text-zinc-500">Width</span>
+                <span className="text-xs text-zinc-500">Width (X)</span>
                 <input
                   type="number"
                   min={1}
@@ -304,7 +422,7 @@ export function PointPreviewer() {
                 />
               </label>
               <label className="block">
-                <span className="text-xs text-zinc-500">Height</span>
+                <span className="text-xs text-zinc-500">Height (Y)</span>
                 <input
                   type="number"
                   min={1}
@@ -343,37 +461,66 @@ export function PointPreviewer() {
         </section>
 
         <section className="rounded-2xl border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-950">
-          <h2 className="text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
-            Markers ({markers.length})
-          </h2>
+          <div className="flex items-baseline justify-between">
+            <h2 className="text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+              Markers ({markers.length})
+            </h2>
+            {markers.length > 0 && (
+              <button
+                type="button"
+                onClick={async () => {
+                  const text = markers
+                    .map((m, i) => `${i + 1}\t${m.x}\t${m.y}`)
+                    .join("\n");
+                  const ok = await copyText(text);
+                  if (ok) flashCopied("all");
+                }}
+                className="text-[10px] font-medium uppercase tracking-wider text-zinc-500 transition-colors hover:text-zinc-900 dark:hover:text-zinc-100"
+                title="Copy all markers as #\tX\tY (TSV)"
+              >
+                {copied === "all" ? "Copied" : "Copy all"}
+              </button>
+            )}
+          </div>
           {markers.length === 0 ? (
             <p className="mt-3 text-xs text-zinc-500">Click on the image to add a marker.</p>
           ) : (
             <ul className="mt-3 space-y-0.5">
-              {markers.map((m, i) => (
-                <li
-                  key={m.id}
-                  className="group flex items-center gap-2 rounded-md px-1.5 py-1 hover:bg-zinc-50 dark:hover:bg-zinc-900"
-                >
-                  <span className="flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full bg-zinc-900 text-[10px] font-medium text-white dark:bg-zinc-100 dark:text-zinc-900">
-                    {i + 1}
-                  </span>
-                  <span className="flex-1 font-mono text-xs text-zinc-700 dark:text-zinc-300">
-                    {m.x}, {m.y}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => setMarkers((ms) => ms.filter((mm) => mm.id !== m.id))}
-                    className="text-zinc-400 opacity-0 transition-opacity hover:text-zinc-900 group-hover:opacity-100 dark:hover:text-zinc-100"
-                    aria-label={`Remove marker ${i + 1}`}
+              {markers.map((m, i) => {
+                const key = `marker-${m.id}`;
+                return (
+                  <li
+                    key={m.id}
+                    className="group flex items-center gap-2 rounded-md px-1.5 py-1 hover:bg-zinc-50 dark:hover:bg-zinc-900"
                   >
-                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                      <line x1="18" y1="6" x2="6" y2="18" />
-                      <line x1="6" y1="6" x2="18" y2="18" />
-                    </svg>
-                  </button>
-                </li>
-              ))}
+                    <span className="flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full bg-zinc-900 text-[10px] font-medium text-white dark:bg-zinc-100 dark:text-zinc-900">
+                      {i + 1}
+                    </span>
+                    <span className="flex-1 font-mono text-xs text-zinc-700 dark:text-zinc-300">
+                      <span className="text-zinc-400 dark:text-zinc-500">X</span> {m.x}
+                      <span className="ml-2 text-zinc-400 dark:text-zinc-500">Y</span> {m.y}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => copyCoord(m.x, m.y, key)}
+                      aria-label={`Copy marker ${i + 1} coordinates`}
+                      title="Copy X, Y"
+                      className="text-zinc-400 opacity-0 transition-opacity hover:text-zinc-900 group-hover:opacity-100 dark:hover:text-zinc-100"
+                    >
+                      {copied === key ? <CheckIcon /> : <CopyIcon />}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setMarkers((ms) => ms.filter((mm) => mm.id !== m.id))}
+                      aria-label={`Remove marker ${i + 1}`}
+                      title="Remove"
+                      className="text-zinc-400 opacity-0 transition-opacity hover:text-zinc-900 group-hover:opacity-100 dark:hover:text-zinc-100"
+                    >
+                      <CloseIcon />
+                    </button>
+                  </li>
+                );
+              })}
             </ul>
           )}
         </section>
@@ -390,5 +537,52 @@ function InfoRow({ label, value }: { label: string; value: string }) {
         {value}
       </dd>
     </div>
+  );
+}
+
+function Divider() {
+  return <div className="mx-1 h-5 w-px bg-zinc-200 dark:bg-zinc-800" />;
+}
+
+function PlusIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <line x1="12" y1="5" x2="12" y2="19" />
+      <line x1="5" y1="12" x2="19" y2="12" />
+    </svg>
+  );
+}
+
+function MinusIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <line x1="5" y1="12" x2="19" y2="12" />
+    </svg>
+  );
+}
+
+function CloseIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <line x1="18" y1="6" x2="6" y2="18" />
+      <line x1="6" y1="6" x2="18" y2="18" />
+    </svg>
+  );
+}
+
+function CopyIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+      <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+    </svg>
+  );
+}
+
+function CheckIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className="text-emerald-600 dark:text-emerald-400">
+      <polyline points="20 6 9 17 4 12" />
+    </svg>
   );
 }
